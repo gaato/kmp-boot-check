@@ -25,27 +25,27 @@ Exit codes:
 - `2`: boot-risk found
 - `3`: the check could not determine the result
 
-## Built-in checks
+## Automatic checks
 
-- `bcachefs`: checked when `/` is bcachefs; module and initrd presence are
-  required and reported as boot-risk.
-- `nvidia`: checked when NVIDIA packages are installed; module presence is
-  required and reported as warning.
-- `zfs`: checked when `/` is zfs; module and initrd presence are required and
-  reported as boot-risk.
-- Generic KMPs: installed `*-kmp-*` packages are scanned for `kmod(...ko)`
-  provides and checked as warning-level module policies for the running/latest
-  kernels. A specific `--kernel` request also checks generic KMPs for that
+Installed `*-kmp-*` packages are scanned for `kmod(...ko)` provides. Each
+provided module becomes an automatic policy:
+
+- runtime KMP modules are warning-level checks for the running and latest
+  kernels. A specific `--kernel` request also checks runtime KMPs for that
   kernel.
+- filesystem KMP modules used by boot-required mounts are promoted to boot-risk.
+  `/` requires the module to be present in the initrd. Other `/etc/fstab` mounts
+  without `nofail` are treated as boot-risk but do not require initrd presence by
+  default.
 
 The checker uses rpmdb as the source of installed bootable kernels and uses
 `modinfo -k <kernel> <module>` as the source of module availability. This avoids
 false results from stale `/usr/lib/modules` directories or weak-modules generated
 files that are not owned by an RPM.
 
-Generic KMP detection is intentionally warning-only. Boot-critical modules should
-use a builtin or configured policy so initrd requirements and severity are
-explicit.
+KMP detection is intentionally conservative. Storage, network-root, accelerator,
+or site-specific boot dependencies that cannot be inferred from mounts should use
+a configured policy so initrd requirements and severity are explicit.
 
 ## Configuration
 
@@ -57,6 +57,7 @@ detect = package:v4l2loopback-kmp-*
 module = v4l2loopback
 initrd = optional
 severity = warning
+scope = important
 ```
 
 Supported `detect` values are:
@@ -68,6 +69,8 @@ Supported `detect` values are:
 
 Supported `initrd` values are `optional`, `required`, and `auto`.
 Supported severities are `warning` and `boot-risk`.
+Supported scopes are `important` and `all`.
+Use `enabled = false` to disable an automatically detected module policy.
 
 ## libzypp system plugin
 

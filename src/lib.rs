@@ -51,7 +51,8 @@ pub struct ModulePolicy {
     pub initrd: InitrdPolicy,
     pub severity: Severity,
     pub reason: String,
-    pub important_kernels_only: bool,
+    pub kernel_scope: KernelScope,
+    pub source: PolicySource,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,11 +61,41 @@ pub struct KmpModule {
     pub module: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootFilesystem {
+    pub fstype: String,
+    pub initrd_required: bool,
+    pub reason: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitrdPolicy {
     Optional,
     Required,
     Auto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelScope {
+    Important,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicySource {
+    AutoKmp,
+    BootFilesystemKmp,
+    Config,
+}
+
+impl PolicySource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutoKmp => "auto-kmp",
+            Self::BootFilesystemKmp => "boot-fs-kmp",
+            Self::Config => "config",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,6 +149,7 @@ pub trait SystemProbe {
     fn installed_kmp_modules(&self) -> Vec<KmpModule>;
     fn running_kernel(&self) -> String;
     fn root_fstype(&self) -> String;
+    fn boot_filesystems(&self) -> Vec<BootFilesystem>;
     fn has_installed_package(&self, patterns: &[String]) -> bool;
     fn has_module(&self, kernel: &str, module: &str) -> bool;
     fn initrd_has_module(&self, kernel: &str, module: &str) -> Option<bool>;
@@ -234,6 +266,65 @@ impl SystemProbe for RealSystemProbe {
             .unwrap_or_default()
     }
 
+    fn boot_filesystems(&self) -> Vec<BootFilesystem> {
+        let mut filesystems = Vec::new();
+        let root_fstype = self.root_fstype();
+        if !root_fstype.is_empty() {
+            filesystems.push(BootFilesystem {
+                fstype: root_fstype,
+                initrd_required: true,
+                reason: "/ is a boot-required mount".to_string(),
+            });
+        }
+
+        let Some(output) = run_output(
+            "findmnt",
+            &[
+                "--fstab",
+                "--noheadings",
+                "--raw",
+                "--output",
+                "FSTYPE,OPTIONS,TARGET",
+            ],
+        ) else {
+            return filesystems;
+        };
+
+        let mut seen = filesystems
+            .iter()
+            .map(|filesystem| filesystem.fstype.clone())
+            .collect::<HashSet<_>>();
+        for line in output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let mut fields = line.split_whitespace();
+            let Some(fstype) = fields.next() else {
+                continue;
+            };
+            let Some(options) = fields.next() else {
+                continue;
+            };
+            let target = fields.next().unwrap_or("mount");
+            if fstype == "swap"
+                || options
+                    .split(',')
+                    .any(|option| option.trim().eq_ignore_ascii_case("nofail"))
+                || !seen.insert(fstype.to_string())
+            {
+                continue;
+            }
+            filesystems.push(BootFilesystem {
+                fstype: fstype.to_string(),
+                initrd_required: false,
+                reason: format!("{target} is configured without nofail"),
+            });
+        }
+
+        filesystems
+    }
+
     fn has_installed_package(&self, patterns: &[String]) -> bool {
         let args = std::iter::once("-qa")
             .chain(patterns.iter().map(String::as_str))
@@ -272,9 +363,7 @@ pub fn run_checks(
         }
     }
 
-    let mut policies = builtin_policies(probe);
-    policies.extend(extra_policies);
-    policies.extend(generic_kmp_policies(probe, &policies));
+    let policies = derive_kmp_policies(probe, extra_policies);
     if policies.iter().all(|policy| !policy.enabled) {
         diagnostics.push("no enabled module policies detected".to_string());
     }
@@ -298,79 +387,68 @@ pub fn exit_code(result: &CheckResult, strict: bool) -> i32 {
     }
 }
 
-pub fn builtin_policies(probe: &dyn SystemProbe) -> Vec<ModulePolicy> {
-    let root_fstype = probe.root_fstype();
-    let mut policies = Vec::new();
-
-    if root_fstype == "bcachefs" {
-        policies.push(ModulePolicy {
-            name: "bcachefs".to_string(),
-            module: "bcachefs".to_string(),
-            enabled: true,
-            initrd: InitrdPolicy::Required,
-            severity: Severity::BootRisk,
-            reason: "/ is mounted as bcachefs".to_string(),
-            important_kernels_only: false,
-        });
-    }
-
-    let nvidia_patterns = vec!["nvidia*".to_string(), "*nvidia*kmp*".to_string()];
-    if probe.has_installed_package(&nvidia_patterns) {
-        policies.push(ModulePolicy {
-            name: "nvidia".to_string(),
-            module: "nvidia".to_string(),
-            enabled: true,
-            initrd: InitrdPolicy::Optional,
-            severity: Severity::Warning,
-            reason: "NVIDIA packages are installed".to_string(),
-            important_kernels_only: false,
-        });
-    }
-
-    if root_fstype == "zfs" {
-        policies.push(ModulePolicy {
-            name: "zfs".to_string(),
-            module: "zfs".to_string(),
-            enabled: true,
-            initrd: InitrdPolicy::Required,
-            severity: Severity::BootRisk,
-            reason: "/ is mounted as zfs".to_string(),
-            important_kernels_only: false,
-        });
-    }
-
-    policies
-}
-
-pub fn generic_kmp_policies(
+pub fn derive_kmp_policies(
     probe: &dyn SystemProbe,
-    existing_policies: &[ModulePolicy],
+    config_policies: Vec<ModulePolicy>,
 ) -> Vec<ModulePolicy> {
-    let existing_modules = existing_policies
-        .iter()
-        .map(|policy| policy.module.as_str())
-        .collect::<HashSet<_>>();
+    let boot_filesystems = probe.boot_filesystems();
     let mut seen_modules = HashSet::new();
     let mut policies = Vec::new();
 
     for kmp_module in probe.installed_kmp_modules() {
-        if existing_modules.contains(kmp_module.module.as_str())
-            || !seen_modules.insert(kmp_module.module.clone())
-        {
+        if !seen_modules.insert(kmp_module.module.clone()) {
             continue;
         }
-        policies.push(ModulePolicy {
-            name: format!("kmp:{}", kmp_module.module),
-            module: kmp_module.module.clone(),
-            enabled: true,
-            initrd: InitrdPolicy::Optional,
-            severity: Severity::Warning,
-            reason: format!("KMP package is installed: {}", kmp_module.package),
-            important_kernels_only: true,
-        });
+        if let Some(filesystem) = boot_filesystems
+            .iter()
+            .find(|filesystem| filesystem.fstype == kmp_module.module)
+        {
+            policies.push(ModulePolicy {
+                name: format!("boot-fs:{}", kmp_module.module),
+                module: kmp_module.module.clone(),
+                enabled: true,
+                initrd: if filesystem.initrd_required {
+                    InitrdPolicy::Required
+                } else {
+                    InitrdPolicy::Optional
+                },
+                severity: Severity::BootRisk,
+                reason: format!(
+                    "{}; filesystem is provided by KMP: {}",
+                    filesystem.reason, kmp_module.package
+                ),
+                kernel_scope: KernelScope::All,
+                source: PolicySource::BootFilesystemKmp,
+            });
+        } else {
+            policies.push(ModulePolicy {
+                name: format!("kmp:{}", kmp_module.module),
+                module: kmp_module.module.clone(),
+                enabled: true,
+                initrd: InitrdPolicy::Optional,
+                severity: Severity::Warning,
+                reason: format!("KMP package is installed: {}", kmp_module.package),
+                kernel_scope: KernelScope::Important,
+                source: PolicySource::AutoKmp,
+            });
+        }
     }
 
+    apply_config_policies(&mut policies, config_policies);
     policies
+}
+
+fn apply_config_policies(policies: &mut Vec<ModulePolicy>, config_policies: Vec<ModulePolicy>) {
+    for config_policy in config_policies {
+        if !config_policy.enabled && config_policy.reason == "configured as disabled" {
+            policies.retain(|policy| policy.module != config_policy.module);
+            continue;
+        }
+        if config_policy.enabled {
+            policies.retain(|policy| policy.module != config_policy.module);
+            policies.push(config_policy);
+        }
+    }
 }
 
 pub fn load_policy_dirs(paths: &[String], probe: &dyn SystemProbe) -> Vec<ModulePolicy> {
@@ -450,7 +528,7 @@ pub fn human_output(result: &CheckResult) -> String {
             };
             let _ = writeln!(
                 output,
-                "  {}: {}: {}; module={}; initrd={}; reason={}",
+                "  {}: {}: {}; module={}; initrd={}; source={}; reason={}",
                 module_result.severity.label(),
                 module_result.policy.name,
                 module_result.message,
@@ -460,6 +538,7 @@ pub fn human_output(result: &CheckResult) -> String {
                     "no"
                 },
                 initrd,
+                module_result.policy.source.label(),
                 module_result.policy.reason
             );
         }
@@ -521,6 +600,8 @@ pub fn json_output(result: &CheckResult) -> String {
                 Some(value) => output.push_str(if value { "true" } else { "false" }),
                 None => output.push_str("null"),
             }
+            output.push_str(",\"source\":");
+            write_json_string(&mut output, module_result.policy.source.label());
             output.push_str(",\"reason\":");
             write_json_string(&mut output, &module_result.policy.reason);
             output.push('}');
@@ -557,7 +638,10 @@ fn check_kernel(
         .iter()
         .filter(|policy| policy.enabled)
         .filter(|policy| {
-            !policy.important_kernels_only || kernel.running || kernel.latest || requested_kernel
+            policy.kernel_scope == KernelScope::All
+                || kernel.running
+                || kernel.latest
+                || requested_kernel
         })
         .map(|policy| check_module(&kernel, policy, probe))
         .collect();
@@ -630,6 +714,8 @@ struct RawPolicy {
     detect: String,
     initrd: InitrdPolicy,
     severity: Severity,
+    kernel_scope: KernelScope,
+    enabled: Option<bool>,
 }
 
 impl RawPolicy {
@@ -640,6 +726,8 @@ impl RawPolicy {
             detect: "always".to_string(),
             initrd: InitrdPolicy::Optional,
             severity: Severity::Warning,
+            kernel_scope: KernelScope::All,
+            enabled: None,
         }
     }
 
@@ -649,12 +737,20 @@ impl RawPolicy {
             "detect" => self.detect = value.to_string(),
             "initrd" => self.initrd = parse_initrd_policy(value),
             "severity" => self.severity = parse_severity(value),
+            "scope" => self.kernel_scope = parse_kernel_scope(value),
+            "enabled" => self.enabled = Some(parse_bool(value)),
             _ => {}
         }
     }
 
     fn finish(self, probe: &dyn SystemProbe) -> ModulePolicy {
-        let (enabled, reason) = detect_policy(&self.detect, probe);
+        let (detected, detect_reason) = detect_policy(&self.detect, probe);
+        let enabled = detected && self.enabled.unwrap_or(true);
+        let reason = if self.enabled == Some(false) {
+            "configured as disabled".to_string()
+        } else {
+            detect_reason
+        };
         ModulePolicy {
             module: self.module.unwrap_or_else(|| self.name.clone()),
             name: self.name,
@@ -662,7 +758,8 @@ impl RawPolicy {
             initrd: self.initrd,
             severity: self.severity,
             reason,
-            important_kernels_only: false,
+            kernel_scope: self.kernel_scope,
+            source: PolicySource::Config,
         }
     }
 }
@@ -710,6 +807,20 @@ fn parse_severity(value: &str) -> Severity {
         "unknown" => Severity::Unknown,
         _ => Severity::Warning,
     }
+}
+
+fn parse_kernel_scope(value: &str) -> KernelScope {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "important" => KernelScope::Important,
+        _ => KernelScope::All,
+    }
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "yes" | "true" | "on"
+    )
 }
 
 fn parse_kmod_provide(value: &str) -> Option<String> {
@@ -777,6 +888,7 @@ mod tests {
         kmp_modules: Vec<KmpModule>,
         running: String,
         root_fstype: String,
+        boot_filesystems: Vec<BootFilesystem>,
         has_packages: bool,
         modules: HashSet<(String, String)>,
         initrd: HashMap<(String, String), Option<bool>>,
@@ -809,6 +921,17 @@ mod tests {
             self.root_fstype.clone()
         }
 
+        fn boot_filesystems(&self) -> Vec<BootFilesystem> {
+            if self.boot_filesystems.is_empty() {
+                return vec![BootFilesystem {
+                    fstype: self.root_fstype.clone(),
+                    initrd_required: true,
+                    reason: "/ is a boot-required mount".to_string(),
+                }];
+            }
+            self.boot_filesystems.clone()
+        }
+
         fn has_installed_package(&self, _patterns: &[String]) -> bool {
             self.has_packages
         }
@@ -827,9 +950,8 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_missing_on_latest_is_warning() {
+    fn runtime_kmp_missing_on_latest_is_warning() {
         let mut probe = FakeProbe::new();
-        probe.has_packages = true;
         probe.kernels = vec![
             Kernel {
                 uname: "1-default".to_string(),
@@ -846,9 +968,13 @@ mod tests {
                 latest: false,
             },
         ];
+        probe.kmp_modules = vec![KmpModule {
+            package: "vendor_gpu-kmp-default-1-1.x86_64".to_string(),
+            module: "vendor_gpu".to_string(),
+        }];
         probe
             .modules
-            .insert(("1-default".to_string(), "nvidia".to_string()));
+            .insert(("1-default".to_string(), "vendor_gpu".to_string()));
 
         let result = run_checks(&probe, None, Vec::new());
 
@@ -867,9 +993,9 @@ mod tests {
     }
 
     #[test]
-    fn bcachefs_missing_initrd_is_boot_risk() {
+    fn boot_filesystem_kmp_missing_initrd_is_boot_risk() {
         let mut probe = FakeProbe::new();
-        probe.root_fstype = "bcachefs".to_string();
+        probe.root_fstype = "myfs".to_string();
         probe.kernels = vec![Kernel {
             uname: "2-default".to_string(),
             package: String::new(),
@@ -877,18 +1003,61 @@ mod tests {
             running: false,
             latest: false,
         }];
+        probe.kmp_modules = vec![KmpModule {
+            package: "myfs-kmp-default-1-1.x86_64".to_string(),
+            module: "myfs".to_string(),
+        }];
         probe
             .modules
-            .insert(("2-default".to_string(), "bcachefs".to_string()));
-        probe.initrd.insert(
-            ("2-default".to_string(), "bcachefs".to_string()),
-            Some(false),
-        );
+            .insert(("2-default".to_string(), "myfs".to_string()));
+        probe
+            .initrd
+            .insert(("2-default".to_string(), "myfs".to_string()), Some(false));
 
         let result = run_checks(&probe, None, Vec::new());
 
         assert_eq!(result.severity(), Severity::BootRisk);
         assert_eq!(exit_code(&result, true), 2);
+    }
+
+    #[test]
+    fn non_nofail_filesystem_kmp_is_boot_risk_without_initrd_requirement() {
+        let mut probe = FakeProbe::new();
+        probe.boot_filesystems = vec![BootFilesystem {
+            fstype: "datafs".to_string(),
+            initrd_required: false,
+            reason: "/srv is configured without nofail".to_string(),
+        }];
+        probe.kernels = vec![Kernel {
+            uname: "1-default".to_string(),
+            package: String::new(),
+            install_time: 1,
+            running: true,
+            latest: false,
+        }];
+        probe.kmp_modules = vec![KmpModule {
+            package: "datafs-kmp-default-1-1.x86_64".to_string(),
+            module: "datafs".to_string(),
+        }];
+        probe
+            .modules
+            .insert(("1-default".to_string(), "datafs".to_string()));
+
+        let result = run_checks(&probe, None, Vec::new());
+
+        assert_eq!(result.severity(), Severity::Ok);
+        assert_eq!(
+            result.kernels[0].module_results[0].policy.severity,
+            Severity::BootRisk
+        );
+        assert_eq!(
+            result.kernels[0].module_results[0].policy.initrd,
+            InitrdPolicy::Optional
+        );
+        assert_eq!(
+            result.kernels[0].module_results[0].policy.source,
+            PolicySource::BootFilesystemKmp
+        );
     }
 
     #[test]
@@ -919,6 +1088,7 @@ mod tests {
             module = v4l2loopback
             initrd = optional
             severity = warning
+            scope = important
             "#,
             &probe,
         );
@@ -927,6 +1097,7 @@ mod tests {
         assert!(policies[0].enabled);
         assert_eq!(policies[0].module, "v4l2loopback");
         assert_eq!(policies[0].severity, Severity::Warning);
+        assert_eq!(policies[0].kernel_scope, KernelScope::Important);
     }
 
     #[test]
@@ -950,6 +1121,10 @@ mod tests {
         assert_eq!(
             result.kernels[0].module_results[0].policy.name,
             "kmp:v4l2loopback"
+        );
+        assert_eq!(
+            result.kernels[0].module_results[0].policy.source,
+            PolicySource::AutoKmp
         );
     }
 
@@ -988,10 +1163,71 @@ mod tests {
     }
 
     #[test]
+    fn config_can_override_auto_kmp_policy() {
+        let mut probe = FakeProbe::new();
+        probe.kernels = vec![Kernel {
+            uname: "1-default".to_string(),
+            package: String::new(),
+            install_time: 1,
+            running: true,
+            latest: false,
+        }];
+        probe.kmp_modules = vec![KmpModule {
+            package: "vendor_net-kmp-default-1-1.x86_64".to_string(),
+            module: "vendor_net".to_string(),
+        }];
+        let policies = parse_policy_config(
+            r#"
+            [module "vendor_net"]
+            initrd = required
+            severity = boot-risk
+            scope = all
+            "#,
+            &probe,
+        );
+
+        let result = run_checks(&probe, None, policies);
+
+        assert_eq!(
+            result.kernels[0].module_results[0].policy.source,
+            PolicySource::Config
+        );
+        assert_eq!(result.severity(), Severity::BootRisk);
+    }
+
+    #[test]
+    fn config_can_disable_auto_kmp_policy() {
+        let mut probe = FakeProbe::new();
+        probe.kernels = vec![Kernel {
+            uname: "1-default".to_string(),
+            package: String::new(),
+            install_time: 1,
+            running: true,
+            latest: false,
+        }];
+        probe.kmp_modules = vec![KmpModule {
+            package: "vendor_cam-kmp-default-1-1.x86_64".to_string(),
+            module: "vendor_cam".to_string(),
+        }];
+        let policies = parse_policy_config(
+            r#"
+            [module "vendor_cam"]
+            enabled = false
+            "#,
+            &probe,
+        );
+
+        let result = run_checks(&probe, None, policies);
+
+        assert_eq!(result.severity(), Severity::Unknown);
+        assert!(result.kernels[0].module_results.is_empty());
+    }
+
+    #[test]
     fn parse_kmod_provide_strips_suffix() {
         assert_eq!(
-            parse_kmod_provide("kmod(nvidia_drm.ko)"),
-            Some("nvidia_drm".to_string())
+            parse_kmod_provide("kmod(vendor_drm.ko)"),
+            Some("vendor_drm".to_string())
         );
     }
 
