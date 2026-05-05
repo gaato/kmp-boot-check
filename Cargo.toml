@@ -1,0 +1,18 @@
+[package]
+name = "kmp-boot-check"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Check whether installed SUSE/openSUSE kernels have boot-critical KMP modules available."
+
+[lib]
+name = "kmp_boot_check"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kmp-boot-check"
+path = "src/bin/kmp-boot-check.rs"
+
+[[bin]]
+name = "zypp-plugin-kmp-boot-check"
+path = "src/bin/zypp-plugin-kmp-boot-check.rs"
