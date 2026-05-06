@@ -41,6 +41,7 @@ pub struct Kernel {
     pub install_time: u64,
     pub running: bool,
     pub latest: bool,
+    pub next_boot: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,8 +78,15 @@ pub enum InitrdPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelScope {
+    NextBoot,
     Important,
     All,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NextBootHint {
+    pub source: String,
+    pub value: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +156,7 @@ pub trait SystemProbe {
     fn installed_kernels(&self) -> Vec<Kernel>;
     fn installed_kmp_modules(&self) -> Vec<KmpModule>;
     fn running_kernel(&self) -> String;
+    fn next_boot_kernel_hint(&self) -> Option<NextBootHint>;
     fn root_fstype(&self) -> String;
     fn boot_filesystems(&self) -> Vec<BootFilesystem>;
     fn has_installed_package(&self, patterns: &[String]) -> bool;
@@ -196,6 +205,7 @@ impl SystemProbe for RealSystemProbe {
                     install_time,
                     running: false,
                     latest: false,
+                    next_boot: false,
                 });
             }
         }
@@ -258,6 +268,24 @@ impl SystemProbe for RealSystemProbe {
         run_output("uname", &["-r"])
             .map(|value| value.trim().to_string())
             .unwrap_or_default()
+    }
+
+    fn next_boot_kernel_hint(&self) -> Option<NextBootHint> {
+        if let Some(value) = run_output("sdbootutil", &["get-default"]) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(NextBootHint {
+                    source: "sdbootutil get-default".to_string(),
+                    value: value.to_string(),
+                });
+            }
+        }
+
+        let output = run_output("bootctl", &["list", "--json=short", "--no-pager"])?;
+        extract_bootctl_default_entry(&output).map(|value| NextBootHint {
+            source: "bootctl list --json=short".to_string(),
+            value,
+        })
     }
 
     fn root_fstype(&self) -> String {
@@ -361,6 +389,13 @@ pub fn run_checks(
         if kernels.is_empty() {
             diagnostics.push(format!("requested kernel is not installed: {requested}"));
         }
+    } else if let Some(hint) = probe.next_boot_kernel_hint()
+        && !annotate_next_boot_kernel(&mut kernels, &hint.value)
+    {
+        diagnostics.push(format!(
+            "next boot entry from {} does not match an installed kernel: {}",
+            hint.source, hint.value
+        ));
     }
 
     let policies = derive_kmp_policies(probe, extra_policies);
@@ -571,9 +606,10 @@ pub fn json_output(result: &CheckResult) -> String {
         write_json_string(&mut output, &kernel_result.kernel.package);
         let _ = write!(
             output,
-            ",\"running\":{},\"latest\":{},\"severity\":\"{}\",\"modules\":[",
+            ",\"running\":{},\"latest\":{},\"next_boot\":{},\"severity\":\"{}\",\"modules\":[",
             kernel_result.kernel.running,
             kernel_result.kernel.latest,
+            kernel_result.kernel.next_boot,
             kernel_result.severity().status()
         );
         for (module_index, module_result) in kernel_result.module_results.iter().enumerate() {
@@ -628,6 +664,22 @@ fn annotate_kernels(mut kernels: Vec<Kernel>, running: &str) -> Vec<Kernel> {
     kernels
 }
 
+fn annotate_next_boot_kernel(kernels: &mut [Kernel], hint: &str) -> bool {
+    let Some(uname) = kernels
+        .iter()
+        .filter(|kernel| hint.contains(&kernel.uname))
+        .max_by(|a, b| a.uname.len().cmp(&b.uname.len()))
+        .map(|kernel| kernel.uname.clone())
+    else {
+        return false;
+    };
+
+    for kernel in kernels {
+        kernel.next_boot = kernel.uname == uname;
+    }
+    true
+}
+
 fn check_kernel(
     kernel: Kernel,
     policies: &[ModulePolicy],
@@ -638,10 +690,11 @@ fn check_kernel(
         .iter()
         .filter(|policy| policy.enabled)
         .filter(|policy| {
-            policy.kernel_scope == KernelScope::All
-                || kernel.running
-                || kernel.latest
-                || requested_kernel
+            requested_kernel
+                || policy.kernel_scope == KernelScope::All
+                || kernel.next_boot
+                || (policy.kernel_scope == KernelScope::Important
+                    && (kernel.running || kernel.latest))
         })
         .map(|policy| check_module(&kernel, policy, probe))
         .collect();
@@ -693,6 +746,9 @@ fn kernel_header(result: &KernelResult) -> String {
     }
     if result.kernel.latest {
         labels.push("latest");
+    }
+    if result.kernel.next_boot {
+        labels.push("next-boot");
     }
     let suffix = if labels.is_empty() {
         String::new()
@@ -810,7 +866,8 @@ fn parse_severity(value: &str) -> Severity {
 }
 
 fn parse_kernel_scope(value: &str) -> KernelScope {
-    match value.trim().to_ascii_lowercase().as_str() {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "next-boot" | "nextboot" => KernelScope::NextBoot,
         "important" => KernelScope::Important,
         _ => KernelScope::All,
     }
@@ -839,6 +896,58 @@ fn module_needles(module: &str) -> Vec<String> {
         format!(" {base}.ko"),
         format!(" {base}.ko."),
     ]
+}
+
+fn extract_bootctl_default_entry(output: &str) -> Option<String> {
+    let normalized = output.replace(char::is_whitespace, "");
+    for object in json_objects(&normalized) {
+        if object.contains("\"isDefault\":true") || object.contains("\"default\":true") {
+            return Some(object.to_string());
+        }
+    }
+    None
+}
+
+fn json_objects(value: &str) -> Vec<&str> {
+    let mut objects = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut in_string = false;
+
+    for (index, byte) in value.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(start) = start.take()
+                {
+                    objects.push(&value[start..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    objects
 }
 
 fn run_output(command: &str, args: &[&str]) -> Option<String> {
@@ -887,6 +996,7 @@ mod tests {
         kernels: Vec<Kernel>,
         kmp_modules: Vec<KmpModule>,
         running: String,
+        next_boot_hint: Option<NextBootHint>,
         root_fstype: String,
         boot_filesystems: Vec<BootFilesystem>,
         has_packages: bool,
@@ -915,6 +1025,10 @@ mod tests {
 
         fn running_kernel(&self) -> String {
             self.running.clone()
+        }
+
+        fn next_boot_kernel_hint(&self) -> Option<NextBootHint> {
+            self.next_boot_hint.clone()
         }
 
         fn root_fstype(&self) -> String {
@@ -959,6 +1073,7 @@ mod tests {
                 install_time: 1,
                 running: false,
                 latest: false,
+                next_boot: false,
             },
             Kernel {
                 uname: "2-default".to_string(),
@@ -966,6 +1081,7 @@ mod tests {
                 install_time: 2,
                 running: false,
                 latest: false,
+                next_boot: false,
             },
         ];
         probe.kmp_modules = vec![KmpModule {
@@ -1002,6 +1118,7 @@ mod tests {
             install_time: 2,
             running: false,
             latest: false,
+            next_boot: false,
         }];
         probe.kmp_modules = vec![KmpModule {
             package: "myfs-kmp-default-1-1.x86_64".to_string(),
@@ -1034,6 +1151,7 @@ mod tests {
             install_time: 1,
             running: true,
             latest: false,
+            next_boot: false,
         }];
         probe.kmp_modules = vec![KmpModule {
             package: "datafs-kmp-default-1-1.x86_64".to_string(),
@@ -1069,6 +1187,7 @@ mod tests {
             install_time: 1,
             running: false,
             latest: false,
+            next_boot: false,
         }];
 
         let result = run_checks(&probe, Some("2-default"), Vec::new());
@@ -1109,6 +1228,7 @@ mod tests {
             install_time: 1,
             running: false,
             latest: false,
+            next_boot: false,
         }];
         probe.kmp_modules = vec![KmpModule {
             package: "v4l2loopback-kmp-default-1-1.x86_64".to_string(),
@@ -1139,6 +1259,7 @@ mod tests {
                 install_time: 1,
                 running: false,
                 latest: false,
+                next_boot: false,
             },
             Kernel {
                 uname: "2-default".to_string(),
@@ -1146,6 +1267,7 @@ mod tests {
                 install_time: 2,
                 running: false,
                 latest: false,
+                next_boot: false,
             },
         ];
         probe.kmp_modules = vec![KmpModule {
@@ -1163,6 +1285,187 @@ mod tests {
     }
 
     #[test]
+    fn next_boot_hint_marks_matching_installed_kernel() {
+        let mut probe = FakeProbe::new();
+        probe.running = "1-default".to_string();
+        probe.next_boot_hint = Some(NextBootHint {
+            source: "test".to_string(),
+            value: "openSUSE-2-default.conf".to_string(),
+        });
+        probe.kernels = vec![
+            Kernel {
+                uname: "1-default".to_string(),
+                package: String::new(),
+                install_time: 1,
+                running: false,
+                latest: false,
+                next_boot: false,
+            },
+            Kernel {
+                uname: "2-default".to_string(),
+                package: String::new(),
+                install_time: 2,
+                running: false,
+                latest: false,
+                next_boot: false,
+            },
+            Kernel {
+                uname: "3-default".to_string(),
+                package: String::new(),
+                install_time: 3,
+                running: false,
+                latest: false,
+                next_boot: false,
+            },
+        ];
+        probe.kmp_modules = vec![KmpModule {
+            package: "vendor_gpu-kmp-default-1-1.x86_64".to_string(),
+            module: "vendor_gpu".to_string(),
+        }];
+        probe
+            .modules
+            .insert(("1-default".to_string(), "vendor_gpu".to_string()));
+        probe
+            .modules
+            .insert(("3-default".to_string(), "vendor_gpu".to_string()));
+
+        let result = run_checks(&probe, None, Vec::new());
+
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.severity(), Severity::Warning);
+        assert!(
+            result
+                .kernels
+                .iter()
+                .find(|kernel| kernel.kernel.uname == "2-default")
+                .unwrap()
+                .kernel
+                .next_boot
+        );
+    }
+
+    #[test]
+    fn unmatched_next_boot_hint_is_diagnostic() {
+        let mut probe = FakeProbe::new();
+        probe.next_boot_hint = Some(NextBootHint {
+            source: "test".to_string(),
+            value: "openSUSE-9-default.conf".to_string(),
+        });
+        probe.kernels = vec![Kernel {
+            uname: "1-default".to_string(),
+            package: String::new(),
+            install_time: 1,
+            running: true,
+            latest: false,
+            next_boot: false,
+        }];
+
+        let result = run_checks(&probe, None, Vec::new());
+
+        assert_eq!(result.severity(), Severity::Unknown);
+        assert!(result.diagnostics[0].contains("does not match an installed kernel"));
+    }
+
+    #[test]
+    fn next_boot_scope_checks_only_next_boot_kernel() {
+        let mut probe = FakeProbe::new();
+        probe.running = "1-default".to_string();
+        probe.next_boot_hint = Some(NextBootHint {
+            source: "test".to_string(),
+            value: "2-default".to_string(),
+        });
+        probe.kernels = vec![
+            Kernel {
+                uname: "1-default".to_string(),
+                package: String::new(),
+                install_time: 1,
+                running: false,
+                latest: false,
+                next_boot: false,
+            },
+            Kernel {
+                uname: "2-default".to_string(),
+                package: String::new(),
+                install_time: 2,
+                running: false,
+                latest: false,
+                next_boot: false,
+            },
+            Kernel {
+                uname: "3-default".to_string(),
+                package: String::new(),
+                install_time: 3,
+                running: false,
+                latest: false,
+                next_boot: false,
+            },
+        ];
+        probe.has_packages = true;
+        let policies = parse_policy_config(
+            r#"
+            [module "vendor_gpu"]
+            detect = package:vendor_gpu-kmp-*
+            module = vendor_gpu
+            scope = next-boot
+            severity = warning
+            "#,
+            &probe,
+        );
+
+        let result = run_checks(&probe, None, policies);
+
+        assert!(result.kernels[0].module_results.is_empty());
+        assert_eq!(result.kernels[1].module_results.len(), 1);
+        assert!(result.kernels[2].module_results.is_empty());
+        assert_eq!(result.severity(), Severity::Warning);
+    }
+
+    #[test]
+    fn requested_kernel_does_not_depend_on_next_boot_hint() {
+        let mut probe = FakeProbe::new();
+        probe.next_boot_hint = Some(NextBootHint {
+            source: "test".to_string(),
+            value: "1-default".to_string(),
+        });
+        probe.kernels = vec![
+            Kernel {
+                uname: "1-default".to_string(),
+                package: String::new(),
+                install_time: 1,
+                running: false,
+                latest: false,
+                next_boot: false,
+            },
+            Kernel {
+                uname: "2-default".to_string(),
+                package: String::new(),
+                install_time: 2,
+                running: false,
+                latest: false,
+                next_boot: false,
+            },
+        ];
+        probe.has_packages = true;
+        let policies = parse_policy_config(
+            r#"
+            [module "vendor_gpu"]
+            detect = package:vendor_gpu-kmp-*
+            module = vendor_gpu
+            scope = next-boot
+            severity = warning
+            "#,
+            &probe,
+        );
+
+        let result = run_checks(&probe, Some("2-default"), policies);
+
+        assert_eq!(result.kernels.len(), 1);
+        assert_eq!(result.kernels[0].kernel.uname, "2-default");
+        assert_eq!(result.kernels[0].module_results.len(), 1);
+        assert!(!result.kernels[0].kernel.next_boot);
+    }
+
+    #[test]
     fn config_can_override_auto_kmp_policy() {
         let mut probe = FakeProbe::new();
         probe.kernels = vec![Kernel {
@@ -1171,6 +1474,7 @@ mod tests {
             install_time: 1,
             running: true,
             latest: false,
+            next_boot: false,
         }];
         probe.kmp_modules = vec![KmpModule {
             package: "vendor_net-kmp-default-1-1.x86_64".to_string(),
@@ -1196,6 +1500,20 @@ mod tests {
     }
 
     #[test]
+    fn config_accepts_next_boot_scope() {
+        let probe = FakeProbe::new();
+        let policies = parse_policy_config(
+            r#"
+            [module "vendor_gpu"]
+            scope = next-boot
+            "#,
+            &probe,
+        );
+
+        assert_eq!(policies[0].kernel_scope, KernelScope::NextBoot);
+    }
+
+    #[test]
     fn config_can_disable_auto_kmp_policy() {
         let mut probe = FakeProbe::new();
         probe.kernels = vec![Kernel {
@@ -1204,6 +1522,7 @@ mod tests {
             install_time: 1,
             running: true,
             latest: false,
+            next_boot: false,
         }];
         probe.kmp_modules = vec![KmpModule {
             package: "vendor_cam-kmp-default-1-1.x86_64".to_string(),
@@ -1228,6 +1547,24 @@ mod tests {
         assert_eq!(
             parse_kmod_provide("kmod(vendor_drm.ko)"),
             Some("vendor_drm".to_string())
+        );
+    }
+
+    #[test]
+    fn bootctl_json_default_entry_is_extracted() {
+        let output = r#"
+        [
+          {"id":"old.conf","title":"old","isDefault":false},
+          {"id":"opensuse-2-default.conf","title":"openSUSE 2","isDefault":true}
+        ]
+        "#;
+
+        assert_eq!(
+            extract_bootctl_default_entry(output),
+            Some(
+                "{\"id\":\"opensuse-2-default.conf\",\"title\":\"openSUSE2\",\"isDefault\":true}"
+                    .to_string()
+            )
         );
     }
 

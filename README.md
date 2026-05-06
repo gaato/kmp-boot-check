@@ -30,9 +30,9 @@ Exit codes:
 Installed `*-kmp-*` packages are scanned for `kmod(...ko)` provides. Each
 provided module becomes an automatic policy:
 
-- runtime KMP modules are warning-level checks for the running and latest
-  kernels. A specific `--kernel` request also checks runtime KMPs for that
-  kernel.
+- runtime KMP modules are warning-level checks for the next-boot, running, and
+  latest kernels. A specific `--kernel` request checks runtime KMPs for that
+  kernel and skips bootloader default detection.
 - filesystem KMP modules used by boot-required mounts are promoted to boot-risk.
   `/` requires the module to be present in the initrd. Other `/etc/fstab` mounts
   without `nofail` are treated as boot-risk but do not require initrd presence by
@@ -47,6 +47,11 @@ KMP detection is intentionally conservative. Storage, network-root, accelerator,
 or site-specific boot dependencies that cannot be inferred from mounts should use
 a configured policy so initrd requirements and severity are explicit.
 
+Next-boot kernel detection is best-effort and read-only. The checker uses
+`sdbootutil get-default` and then `bootctl list --json=short` when available. If
+the bootloader default cannot be mapped to an installed kernel, the checker falls
+back to the running/latest kernel behavior and reports a diagnostic.
+
 ## Configuration
 
 Additional modules can be configured in `/etc/kmp-boot-check/modules.d/*.conf`:
@@ -60,6 +65,19 @@ severity = warning
 scope = important
 ```
 
+For example, a system that relies on early KMS for a graphics KMP can make that
+module a next-boot-only boot-risk policy without making the checker responsible
+for desktop driver health:
+
+```ini
+[module "nvidia_drm"]
+detect = package:nvidia-driver-G06-kmp-*
+module = nvidia_drm
+initrd = auto
+severity = boot-risk
+scope = next-boot
+```
+
 Supported `detect` values are:
 
 - `always`
@@ -69,8 +87,12 @@ Supported `detect` values are:
 
 Supported `initrd` values are `optional`, `required`, and `auto`.
 Supported severities are `warning` and `boot-risk`.
-Supported scopes are `important` and `all`.
+Supported scopes are `next-boot`, `important`, and `all`.
 Use `enabled = false` to disable an automatically detected module policy.
+
+`kmp-boot-check` does not check desktop or userland driver health. It does not
+validate repositories, Xorg/Wayland drivers, firmware packages, command-line
+blacklists, `nvidia-smi`, or desktop session state. Those are separate checks.
 
 ## libzypp system plugin
 
