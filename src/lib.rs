@@ -281,9 +281,18 @@ impl SystemProbe for RealSystemProbe {
             }
         }
 
-        let output = run_output("bootctl", &["list", "--json=short", "--no-pager"])?;
-        extract_bootctl_default_entry(&output).map(|value| NextBootHint {
-            source: "bootctl list --json=short".to_string(),
+        if let Some(output) = run_output("bootctl", &["list", "--json=short", "--no-pager"])
+            && let Some(value) = extract_bootctl_default_entry(&output)
+        {
+            return Some(NextBootHint {
+                source: "bootctl list --json=short".to_string(),
+                value,
+            });
+        }
+
+        let output = run_output_any_status("bootctl", &["status", "--no-pager"])?;
+        extract_bootctl_status_default_entry(&output).map(|value| NextBootHint {
+            source: "bootctl status".to_string(),
             value,
         })
     }
@@ -908,6 +917,16 @@ fn extract_bootctl_default_entry(output: &str) -> Option<String> {
     None
 }
 
+fn extract_bootctl_status_default_entry(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("Default Entry:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
 fn json_objects(value: &str) -> Vec<&str> {
     let mut objects = Vec::new();
     let mut start = None;
@@ -953,6 +972,14 @@ fn json_objects(value: &str) -> Vec<&str> {
 fn run_output(command: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(command).args(args).output().ok()?;
     if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_output_any_status(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if output.stdout.is_empty() {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -1565,6 +1592,21 @@ mod tests {
                 "{\"id\":\"opensuse-2-default.conf\",\"title\":\"openSUSE2\",\"isDefault\":true}"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn bootctl_status_default_entry_is_extracted() {
+        let output = r#"
+        Current Boot Loader:
+               Product: GRUB2 2.14
+         Current Entry: system-opensuse-tumbleweed-7.0.1-default-1.conf
+         Default Entry: system-opensuse-tumbleweed-7.0.2-default-1.conf
+        "#;
+
+        assert_eq!(
+            extract_bootctl_status_default_entry(output),
+            Some("system-opensuse-tumbleweed-7.0.2-default-1.conf".to_string())
         );
     }
 
