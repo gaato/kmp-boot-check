@@ -1,13 +1,20 @@
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::process::Command;
 
 fn main() -> io::Result<()> {
-    let mut input = Vec::new();
-    io::stdin().read_to_end(&mut input)?;
-    for frame in input.split(|byte| *byte == 0) {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut frame = Vec::new();
+
+    while input.read_until(0, &mut frame)? != 0 {
+        if frame.last() == Some(&0) {
+            frame.pop();
+        }
         if frame.is_empty() {
+            frame.clear();
             continue;
         }
+
         let command = frame
             .split(|byte| *byte == b'\n')
             .next()
@@ -25,6 +32,7 @@ fn main() -> io::Result<()> {
             }
             _ => enomethod()?,
         }
+        frame.clear();
     }
     Ok(())
 }
@@ -51,9 +59,15 @@ fn run_check() {
 }
 
 fn ack() -> io::Result<()> {
-    io::stdout().write_all(b"ACK\n\n\0")
+    write_response(b"ACK\n\n\0")
 }
 
 fn enomethod() -> io::Result<()> {
-    io::stdout().write_all(b"_ENOMETHOD\n\n\0")
+    write_response(b"_ENOMETHOD\n\n\0")
+}
+
+fn write_response(response: &[u8]) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    stdout.write_all(response)?;
+    stdout.flush()
 }
